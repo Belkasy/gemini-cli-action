@@ -79,7 +79,6 @@ runs:
     - name: 'Validate inputs'
       shell: 'bash'
       run: '${{ github.action_path }}/scripts/validate-inputs.sh'
-      # <-- CHANGE: Allow this non-critical validation step to fail without stopping the job.
       continue-on-error: true
       env:
         INPUT_GEMINI_API_KEY_PRESENT: "${{ inputs.gemini_api_key != '' }}"
@@ -156,7 +155,8 @@ runs:
 
         if [[ "${DEBUG}" == "true" ]]; then
           echo "::warning::Gemini CLI debug logging is enabled."
-          if ! gemini --yolo --prompt "${PROMPT}" --debug --verbose 2> >(tee "${TEMP_STDERR}" >&2) > >(tee "${TEMP_STDOUT}"); then
+          # <-- CHANGE: Removed the unsupported '--verbose' flag.
+          if ! gemini --yolo --prompt "${PROMPT}" --debug 2> >(tee "${TEMP_STDERR}" >&2) > >(tee "${TEMP_STDOUT}"); then
             FAILED=true
           fi
         else
