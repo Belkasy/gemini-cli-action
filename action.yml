@@ -76,127 +76,127 @@ outputs:
 runs:
   using: 'composite'
   steps:
-  - name: 'Validate inputs'
-    shell: 'bash'
-    run: '${{ github.action_path }}/scripts/validate-inputs.sh'
-    env:
-      INPUT_GEMINI_API_KEY_PRESENT: "${{ inputs.gemini_api_key != '' }}"
-      INPUT_GOOGLE_API_KEY_PRESENT: "${{ inputs.google_api_key != '' }}"
-      INPUT_GCP_WORKLOAD_IDENTITY_PROVIDER_PRESENT: "${{ inputs.gcp_workload_identity_provider != '' }}"
-      INPUT_GCP_PROJECT_ID_PRESENT: "${{ inputs.gcp_project_id != '' }}"
-      INPUT_GCP_SERVICE_ACCOUNT_PRESENT: "${{ inputs.gcp_service_account != '' }}"
-      INPUT_USE_VERTEX_AI: '${{ inputs.use_vertex_ai }}'
-      INPUT_USE_GEMINI_CODE_ASSIST: '${{ inputs.use_gemini_code_assist }}'
+    - name: 'Validate inputs'
+      shell: 'bash'
+      run: '${{ github.action_path }}/scripts/validate-inputs.sh'
+      # <-- CHANGE: Allow this non-critical validation step to fail without stopping the job.
+      continue-on-error: true
+      env:
+        INPUT_GEMINI_API_KEY_PRESENT: "${{ inputs.gemini_api_key != '' }}"
+        INPUT_GOOGLE_API_KEY_PRESENT: "${{ inputs.google_api_key != '' }}"
+        INPUT_GCP_WORKLOAD_IDENTITY_PROVIDER_PRESENT: "${{ inputs.gcp_workload_identity_provider != '' }}"
+        INPUT_GCP_PROJECT_ID_PRESENT: "${{ inputs.gcp_project_id != '' }}"
+        INPUT_GCP_SERVICE_ACCOUNT_PRESENT: "${{ inputs.gcp_service_account != '' }}"
+        INPUT_USE_VERTEX_AI: '${{ inputs.use_vertex_ai }}'
+        INPUT_USE_GEMINI_CODE_ASSIST: '${{ inputs.use_gemini_code_assist }}'
 
-  - name: 'Configure Gemini CLI'
-    if: ${{ inputs.settings != '' }}
-    run: |-
-      mkdir -p .gemini/
-      echo "${SETTINGS}" > ".gemini/settings.json"
-    shell: 'bash'
-    env:
-      SETTINGS: '${{ inputs.settings }}'
+    - name: 'Configure Gemini CLI'
+      if: ${{ inputs.settings != '' }}
+      run: |-
+        mkdir -p .gemini/
+        echo "${SETTINGS}" > ".gemini/settings.json"
+      shell: 'bash'
+      env:
+        SETTINGS: '${{ inputs.settings }}'
 
-  - name: 'Authenticate to Google Cloud'
-    if: ${{ inputs.gcp_workload_identity_provider != '' }}
-    id: 'auth'
-    uses: 'google-github-actions/auth@v2' # ratchet:exclude
-    with:
-      project_id: '${{ inputs.gcp_project_id }}'
-      workload_identity_provider: '${{ inputs.gcp_workload_identity_provider }}'
-      service_account: '${{ inputs.gcp_service_account }}'
-      token_format: 'access_token'
-      access_token_scopes: 'https://www.googleapis.com/auth/cloud-platform,https://www.googleapis.com/auth/userinfo.email,https://www.googleapis.com/auth/userinfo.profile'
+    - name: 'Authenticate to Google Cloud'
+      if: ${{ inputs.gcp_workload_identity_provider != '' }}
+      id: 'auth'
+      uses: 'google-github-actions/auth@v2' # ratchet:exclude
+      with:
+        project_id: '${{ inputs.gcp_project_id }}'
+        workload_identity_provider: '${{ inputs.gcp_workload_identity_provider }}'
+        service_account: '${{ inputs.gcp_service_account }}'
+        token_format: 'access_token'
+        access_token_scopes: 'https://www.googleapis.com/auth/cloud-platform,https://www.googleapis.com/auth/userinfo.email,https://www.googleapis.com/auth/userinfo.profile'
 
-  - name: 'Install Gemini CLI'
-    id: 'install'
-    env:
-      GEMINI_CLI_VERSION: '${{ inputs.gemini_cli_version }}'
-    shell: 'bash'
-    # <-- CHANGE: Added continue-on-error to ensure we can report failures gracefully.
-    continue-on-error: true
-    run: |-
-      set -exo pipefail
+    - name: 'Install Gemini CLI'
+      id: 'install'
+      env:
+        GEMINI_CLI_VERSION: '${{ inputs.gemini_cli_version }}'
+      shell: 'bash'
+      continue-on-error: true
+      run: |-
+        set -exo pipefail
 
-      echo "Installing Gemini CLI from GitHub: https://github.com/Belkasy/gemini-cli-gcp-proxy-auth"
-      git clone https://github.com/Belkasy/gemini-cli-gcp-proxy-auth.git gemini-cli
-      cd gemini-cli
+        echo "Installing Gemini CLI from GitHub: https://github.com/Belkasy/gemini-cli-gcp-proxy-auth"
+        git clone https://github.com/Belkasy/gemini-cli-gcp-proxy-auth.git gemini-cli
+        cd gemini-cli
+        
+        echo "Checking out version: ${GEMINI_CLI_VERSION}"
+        git checkout "${GEMINI_CLI_VERSION}"
 
-      echo "Checking out version: ${GEMINI_CLI_VERSION}"
-      git checkout "${GEMINI_CLI_VERSION}"
+        echo "Installing dependencies..."
+        npm install
+        echo "Bundling CLI..."
+        npm run bundle
+        echo "Installing globally..."
+        npm install --silent --no-audit --prefer-offline --global .
 
-      echo "Installing dependencies..."
-      npm install
-      echo "Bundling CLI..."
-      npm run bundle
-      echo "Installing globally..."
-      npm install --silent --no-audit --prefer-offline --global .
+        echo "Verifying installation:"
+        gemini --version
 
-      echo "Verifying installation:"
-      gemini --version
-
-  # <-- ADDED: This new step checks if the installation failed and provides a clear error.
-  - name: 'Check Installation Status'
-    if: steps.install.outcome == 'failure'
-    shell: 'bash'
-    run: |
-      echo "::error::Failed to install the Gemini CLI. Please check the logs for the 'Install Gemini CLI' step above for specific errors (e.g., git checkout issues, npm failures)."
-      exit 1
-
-  - name: 'Run Gemini CLI'
-    id: 'gemini_run'
-    shell: 'bash'
-    run: |-
-      set -euo pipefail
-
-      TEMP_STDOUT="$(mktemp)"
-      TEMP_STDERR="$(mktemp)"
-      trap 'rm -f "${TEMP_STDOUT}" "${TEMP_STDERR}"' EXIT
-      FAILED=false
-
-      # <-- CHANGE: Simplified command execution to be safer than using 'eval'.
-      if [[ "${DEBUG}" == "true" ]]; then
-        echo "::warning::Gemini CLI debug logging is enabled."
-        if ! gemini --yolo --prompt "${PROMPT}" --debug --verbose 2> >(tee "${TEMP_STDERR}" >&2) > >(tee "${TEMP_STDOUT}"); then
-          FAILED=true
-        fi
-      else
-        if ! gemini --yolo --prompt "${PROMPT}" 2> "${TEMP_STDERR}" > "${TEMP_STDOUT}"; then
-          FAILED=true
-        fi
-      fi
-
-      GEMINI_RESPONSE="$(cat "${TEMP_STDOUT}")"
-      GEMINI_ERRORS="$(cat "${TEMP_STDERR}")"
-
-      echo "gemini_response<<EOF" >> "${GITHUB_OUTPUT}"
-      echo "${GEMINI_RESPONSE}" >> "${GITHUB_OUTPUT}"
-      echo "EOF" >> "${GITHUB_OUTPUT}"
-
-      echo "gemini_errors<<EOF" >> "${GITHUB_OUTPUT}"
-      echo "${GEMINI_ERRORS}" >> "${GITHUB_OUTPUT}"
-      echo "EOF" >> "${GITHUB_OUTPUT}"
-
-      if [[ "${FAILED}" == "true" ]]; then
-        echo "::error title=Gemini CLI execution failed::See full error log below."
-        echo "--- Full Error Log ---"
-        cat "${TEMP_STDERR}"
-        echo "----------------------"
+    - name: 'Check Installation Status'
+      if: steps.install.outcome == 'failure'
+      shell: 'bash'
+      run: |
+        echo "::error::Failed to install the Gemini CLI. Please check the logs for the 'Install Gemini CLI' step above for specific errors (e.g., git checkout issues, npm failures)."
         exit 1
-      fi
-    env:
-      DEBUG: '${{ fromJSON(inputs.gemini_debug || false) }}'
-      GEMINI_API_KEY: '${{ inputs.gemini_api_key }}'
-      SURFACE: 'GitHub'
-      GOOGLE_CLOUD_PROJECT: '${{ inputs.gcp_project_id }}'
-      GOOGLE_CLOUD_LOCATION: '${{ inputs.gcp_location }}'
-      GOOGLE_GENAI_USE_VERTEXAI: '${{ inputs.use_vertex_ai }}'
-      GOOGLE_API_KEY: '${{ inputs.google_api_key }}'
-      GOOGLE_GENAI_USE_GCA: '${{ inputs.use_gemini_code_assist }}'
-      GOOGLE_CLOUD_ACCESS_TOKEN: '${{steps.auth.outputs.access_token}}'
-      PROMPT: '${{ inputs.prompt }}'
-      GEMINI_MODEL: '${{ inputs.gemini_model }}'
+
+    - name: 'Run Gemini CLI'
+      id: 'gemini_run'
+      shell: 'bash'
+      run: |-
+        set -euo pipefail
+
+        TEMP_STDOUT="$(mktemp)"
+        TEMP_STDERR="$(mktemp)"
+        trap 'rm -f "${TEMP_STDOUT}" "${TEMP_STDERR}"' EXIT
+        FAILED=false
+
+        if [[ "${DEBUG}" == "true" ]]; then
+          echo "::warning::Gemini CLI debug logging is enabled."
+          if ! gemini --yolo --prompt "${PROMPT}" --debug --verbose 2> >(tee "${TEMP_STDERR}" >&2) > >(tee "${TEMP_STDOUT}"); then
+            FAILED=true
+          fi
+        else
+          if ! gemini --yolo --prompt "${PROMPT}" 2> "${TEMP_STDERR}" > "${TEMP_STDOUT}"; then
+            FAILED=true
+          fi
+        fi
+
+        GEMINI_RESPONSE="$(cat "${TEMP_STDOUT}")"
+        GEMINI_ERRORS="$(cat "${TEMP_STDERR}")"
+
+        echo "gemini_response<<EOF" >> "${GITHUB_OUTPUT}"
+        echo "${GEMINI_RESPONSE}" >> "${GITHUB_OUTPUT}"
+        echo "EOF" >> "${GITHUB_OUTPUT}"
+
+        echo "gemini_errors<<EOF" >> "${GITHUB_OUTPUT}"
+        echo "${GEMINI_ERRORS}" >> "${GITHUB_OUTPUT}"
+        echo "EOF" >> "${GITHUB_OUTPUT}"
+
+        if [[ "${FAILED}" == "true" ]]; then
+          echo "::error title=Gemini CLI execution failed::See full error log below."
+          echo "--- Full Error Log ---"
+          cat "${TEMP_STDERR}"
+          echo "----------------------"
+          exit 1
+        fi
+      env:
+        DEBUG: '${{ fromJSON(inputs.gemini_debug || false) }}'
+        GEMINI_API_KEY: '${{ inputs.gemini_api_key }}'
+        SURFACE: 'GitHub'
+        GOOGLE_CLOUD_PROJECT: '${{ inputs.gcp_project_id }}'
+        GOOGLE_CLOUD_LOCATION: '${{ inputs.gcp_location }}'
+        GOOGLE_GENAI_USE_VERTEXAI: '${{ inputs.use_vertex_ai }}'
+        GOOGLE_API_KEY: '${{ inputs.google_api_key }}'
+        GOOGLE_GENAI_USE_GCA: '${{ inputs.use_gemini_code_assist }}'
+        GOOGLE_CLOUD_ACCESS_TOKEN: '${{steps.auth.outputs.access_token}}'
+        PROMPT: '${{ inputs.prompt }}'
+        GEMINI_MODEL: '${{ inputs.gemini_model }}'
 
 branding:
   icon: 'terminal'
   color: 'blue'
+
