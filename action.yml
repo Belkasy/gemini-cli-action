@@ -34,9 +34,9 @@ inputs:
     description: 'The API key for the Gemini API.'
     required: false
   gemini_cli_version:
-    description: 'The version of the Gemini CLI to install. Can be "latest", "preview", "nightly", a specific version number, or a git branch, tag, or commit. For more information, see [Gemini CLI releases](https://github.com/google-gemini/gemini-cli/blob/main/docs/releases.md).'
+    description: 'The version of the Gemini CLI to install. Can be a git branch, tag, or commit.'
     required: false
-    default: 'latest'
+    default: 'main'
   gemini_debug:
     description: 'Enable debug logging and output streaming.'
     required: false
@@ -57,15 +57,11 @@ inputs:
       For more details, see the documentation on [settings files](https://github.com/google-gemini/gemini-cli/blob/main/docs/cli/configuration.md#settings-files).
     required: false
   use_gemini_code_assist:
-    description: |-
-      Whether to use Code Assist for Gemini model access instead of the default Gemini API key.
-      For more information, see the [Gemini CLI documentation](https://github.com/google-gemini/gemini-cli/blob/main/docs/cli/authentication.md).
+    description: 'Whether to use Code Assist for Gemini model access.'
     required: false
     default: 'false'
   use_vertex_ai:
-    description: |-
-      Whether to use Vertex AI for Gemini model access instead of the default Gemini API key.
-      For more information, see the [Gemini CLI documentation](https://github.com/google-gemini/gemini-cli/blob/main/docs/cli/authentication.md).
+    description: 'Whether to use Vertex AI for Gemini model access.'
     required: false
     default: 'false'
 
@@ -83,6 +79,7 @@ runs:
     - name: 'Validate inputs'
       shell: 'bash'
       run: '${{ github.action_path }}/scripts/validate-inputs.sh'
+      continue-on-error: true
       env:
         INPUT_GEMINI_API_KEY_PRESENT: "${{ inputs.gemini_api_key != '' }}"
         INPUT_GOOGLE_API_KEY_PRESENT: "${{ inputs.google_api_key != '' }}"
@@ -91,9 +88,9 @@ runs:
         INPUT_GCP_SERVICE_ACCOUNT_PRESENT: "${{ inputs.gcp_service_account != '' }}"
         INPUT_USE_VERTEX_AI: '${{ inputs.use_vertex_ai }}'
         INPUT_USE_GEMINI_CODE_ASSIST: '${{ inputs.use_gemini_code_assist }}'
+
     - name: 'Configure Gemini CLI'
-      if: |-
-        ${{ inputs.settings != '' }}
+      if: ${{ inputs.settings != '' }}
       run: |-
         mkdir -p .gemini/
         echo "${SETTINGS}" > ".gemini/settings.json"
@@ -102,8 +99,7 @@ runs:
         SETTINGS: '${{ inputs.settings }}'
 
     - name: 'Authenticate to Google Cloud'
-      if: |-
-        ${{ inputs.gcp_workload_identity_provider != '' }}
+      if: ${{ inputs.gcp_workload_identity_provider != '' }}
       id: 'auth'
       uses: 'google-github-actions/auth@v2' # ratchet:exclude
       with:
@@ -113,49 +109,38 @@ runs:
         token_format: 'access_token'
         access_token_scopes: 'https://www.googleapis.com/auth/cloud-platform,https://www.googleapis.com/auth/userinfo.email,https://www.googleapis.com/auth/userinfo.profile'
 
-    - name: 'Run Telemetry Collector for Google Cloud'
-      if: |-
-        ${{ inputs.gcp_workload_identity_provider != '' }}
-      env:
-        OTLP_GOOGLE_CLOUD_PROJECT: '${{ inputs.gcp_project_id }}'
-        GITHUB_ACTION_PATH: '${{ github.action_path }}'
-      shell: 'bash'
-      run: |-
-        set -euo pipefail
-        mkdir -p .gemini/
-        sed "s/OTLP_GOOGLE_CLOUD_PROJECT/${OTLP_GOOGLE_CLOUD_PROJECT}/g" "${GITHUB_ACTION_PATH}/scripts/collector-gcp.yaml.template" > ".gemini/collector-gcp.yaml"
-
-        chmod 444 "$GOOGLE_APPLICATION_CREDENTIALS"
-        docker run -d --name gemini-telemetry-collector --network host \
-          -v "${GITHUB_WORKSPACE}:/github/workspace" \
-          -e "GOOGLE_APPLICATION_CREDENTIALS=${GOOGLE_APPLICATION_CREDENTIALS/$GITHUB_WORKSPACE//github/workspace}" \
-          -w "/github/workspace" \
-          otel/opentelemetry-collector-contrib:0.128.0 \
-          --config /github/workspace/.gemini/collector-gcp.yaml
-
     - name: 'Install Gemini CLI'
       id: 'install'
       env:
         GEMINI_CLI_VERSION: '${{ inputs.gemini_cli_version }}'
       shell: 'bash'
+      continue-on-error: true
       run: |-
-        set -euo pipefail
+        set -exo pipefail
 
         echo "Installing Gemini CLI from GitHub: https://github.com/Belkasy/gemini-cli-gcp-proxy-auth"
         git clone https://github.com/Belkasy/gemini-cli-gcp-proxy-auth.git gemini-cli
         cd gemini-cli
-        git checkout "${VERSION_INPUT}"
-        npm install
-        npm run bundle
-        npm install --silent --no-audit --prefer-offline --global .
         
+        echo "Checking out version: ${GEMINI_CLI_VERSION}"
+        git checkout "${GEMINI_CLI_VERSION}"
+
+        echo "Installing dependencies..."
+        npm install
+        echo "Bundling CLI..."
+        npm run bundle
+        echo "Installing globally..."
+        npm install --silent --no-audit --prefer-offline --global .
+
         echo "Verifying installation:"
-        if command -v gemini >/dev/null 2>&1; then
-          gemini --version || echo "Gemini CLI installed successfully (version command not available)"
-        else
-          echo "Error: Gemini CLI not found in PATH"
-          exit 1
-        fi
+        gemini --version
+
+    - name: 'Check Installation Status'
+      if: steps.install.outcome == 'failure'
+      shell: 'bash'
+      run: |
+        echo "::error::Failed to install the Gemini CLI. Please check the logs for the 'Install Gemini CLI' step above for specific errors (e.g., git checkout issues, npm failures)."
+        exit 1
 
     - name: 'Run Gemini CLI'
       id: 'gemini_run'
@@ -163,48 +148,39 @@ runs:
       run: |-
         set -euo pipefail
 
-        # Create a temporary directory for storing the output, and ensure it's
-        # cleaned up later
-        TEMP_STDOUT="$(mktemp -p "${RUNNER_TEMP}" gemini-out.XXXXXXXXXX)"
-        TEMP_STDERR="$(mktemp -p "${RUNNER_TEMP}" gemini-err.XXXXXXXXXX)"
-        function cleanup {
-          rm -f "${TEMP_STDOUT}" "${TEMP_STDERR}"
-        }
-        trap cleanup EXIT
-
-        # Keep track of whether we've failed
+        TEMP_STDOUT="$(mktemp)"
+        TEMP_STDERR="$(mktemp)"
+        trap 'rm -f "${TEMP_STDOUT}" "${TEMP_STDERR}"' EXIT
         FAILED=false
 
-        # Run Gemini CLI with the provided prompt, streaming responses in debug
-        if [[ "${DEBUG}" = true ]]; then
-          echo "::warning::Gemini CLI debug logging is enabled. This will stream responses, which could reveal sensitive information if processed with untrusted inputs."
-          if ! { gemini --yolo --prompt "${PROMPT}" 2> >(tee "${TEMP_STDERR}" >&2) | tee "${TEMP_STDOUT}"; }; then
+        if [[ "${DEBUG}" == "true" ]]; then
+          echo "::warning::Gemini CLI debug logging is enabled."
+          # <-- CHANGE: Removed the unsupported '--verbose' flag.
+          if ! gemini --yolo --prompt "${PROMPT}" --debug 2> >(tee "${TEMP_STDERR}" >&2) > >(tee "${TEMP_STDOUT}"); then
             FAILED=true
           fi
         else
-          if ! gemini --yolo --prompt "${PROMPT}" 2> "${TEMP_STDERR}" 1> "${TEMP_STDOUT}"; then
+          if ! gemini --yolo --prompt "${PROMPT}" 2> "${TEMP_STDERR}" > "${TEMP_STDOUT}"; then
             FAILED=true
           fi
         fi
 
         GEMINI_RESPONSE="$(cat "${TEMP_STDOUT}")"
+        GEMINI_ERRORS="$(cat "${TEMP_STDERR}")"
 
-        # Set the captured response as a step output, supporting multiline
         echo "gemini_response<<EOF" >> "${GITHUB_OUTPUT}"
         echo "${GEMINI_RESPONSE}" >> "${GITHUB_OUTPUT}"
         echo "EOF" >> "${GITHUB_OUTPUT}"
 
-        GEMINI_ERRORS="$(cat "${TEMP_STDERR}")"
-
-        # Set the captured errors as a step output, supporting multiline
         echo "gemini_errors<<EOF" >> "${GITHUB_OUTPUT}"
         echo "${GEMINI_ERRORS}" >> "${GITHUB_OUTPUT}"
         echo "EOF" >> "${GITHUB_OUTPUT}"
 
-        if [[ "${FAILED}" = true ]]; then
-          LAST_LINE="$(echo "${GEMINI_ERRORS}" | tail -n1)"
-          echo "::error title=Gemini CLI execution failed::${LAST_LINE}"
-          echo "See logs for more details"
+        if [[ "${FAILED}" == "true" ]]; then
+          echo "::error title=Gemini CLI execution failed::See full error log below."
+          echo "--- Full Error Log ---"
+          cat "${TEMP_STDERR}"
+          echo "----------------------"
           exit 1
         fi
       env:
@@ -223,3 +199,4 @@ runs:
 branding:
   icon: 'terminal'
   color: 'blue'
+
